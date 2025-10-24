@@ -9,19 +9,20 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-//Configuration ....
+// Configuration ....
 type Configuration struct {
 	SelenosisHost      string
 	ServiceName        string
 	SidecarPort        string
 	SessionLimit       int
 	SessionRetryCount  int
+	RequestRetryCount  int
 	BrowserWaitTimeout time.Duration
 	SessionIdleTimeout time.Duration
 	BuildVersion       string
 }
 
-//App ...
+// App ...
 type App struct {
 	logger             *log.Logger
 	client             platform.Platform
@@ -31,13 +32,14 @@ type App struct {
 	sidecarPort        string
 	sessionLimit       int
 	sessionRetryCount  int
+	requestRetryCount  int
 	sessionIdleTimeout time.Duration
 	browserWaitTimeout time.Duration
 	buildVersion       string
 	stats              *storage.Storage
 }
 
-//New ...
+// New ...
 func New(logger *log.Logger, client platform.Platform, browsers *config.BrowsersConfig, cfg Configuration) *App {
 
 	storage := storage.New()
@@ -82,7 +84,7 @@ func New(logger *log.Logger, client platform.Platform, browsers *config.Browsers
 	go func() {
 		for {
 			select {
-			case event := <- ch:
+			case event := <-ch:
 				switch event.PlatformObject.(type) {
 				case platform.Service:
 					service := event.PlatformObject.(platform.Service)
@@ -161,6 +163,7 @@ func New(logger *log.Logger, client platform.Platform, browsers *config.Browsers
 		sidecarPort:        cfg.SidecarPort,
 		sessionLimit:       cfg.SessionLimit,
 		sessionRetryCount:  cfg.SessionRetryCount,
+		requestRetryCount:  cfg.RequestRetryCount,
 		browserWaitTimeout: cfg.BrowserWaitTimeout,
 		sessionIdleTimeout: cfg.SessionIdleTimeout,
 		buildVersion:       cfg.BuildVersion,

@@ -29,6 +29,14 @@ var (
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+		Transport: &http.Transport{
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			DisableKeepAlives:     false,
+			ResponseHeaderTimeout: 10 * time.Minute,
+		},
+		Timeout: 0, // No timeout - let browser's pageLoad timeout control this
 	}
 	dialer net.Dialer
 )
@@ -58,7 +66,7 @@ type response struct {
 	Selenosis Status `json:"selenosis,omitempty"`
 }
 
-//HandleSession ...
+// HandleSession ...
 func (app *App) HandleSession(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	logger := app.logger.WithFields(logrus.Fields{
@@ -116,15 +124,24 @@ func (app *App) HandleSession(w http.ResponseWriter, r *http.Request) {
 	logger.WithField("time_elapsed", tools.TimeElapsed(start)).Infof("starting browser from image: %s", browser.Image)
 
 	image := parseImage(browser.Image)
-	service, err := app.client.Service().Create(platform.ServiceSpec{
-		SessionID:             fmt.Sprintf("%s-%s", image, uuid.New()),
-		RequestedCapabilities: caps,
-		Template:              browser,
-	})
-	if err != nil {
-		logger.WithField("time_elapsed", tools.TimeElapsed(start)).Errorf("failed to start browser: %v", err)
-		tools.JSONError(w, err.Error(), http.StatusBadRequest)
-		return
+
+	var service platform.Service
+	j := 1
+	for ; ; j++ {
+		service, err = app.client.Service().Create(platform.ServiceSpec{
+			SessionID:             fmt.Sprintf("%s-%s", image, uuid.New()),
+			RequestedCapabilities: caps,
+			Template:              browser,
+		})
+		if err != nil {
+			logger.WithField("time_elapsed", tools.TimeElapsed(start)).Errorf("failed to start browser: %v", err)
+			if j < app.sessionRetryCount {
+				continue
+			}
+			tools.JSONError(w, "failed to start browser: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		break
 	}
 
 	cancel := func() {
@@ -152,6 +169,7 @@ func (app *App) HandleSession(w http.ResponseWriter, r *http.Request) {
 			case context.DeadlineExceeded:
 				logger.WithField("time_elapsed", tools.TimeElapsed(start)).Warn("session attempt timeout")
 				if i < app.sessionRetryCount {
+					logger.WithField("time_elapsed", tools.TimeElapsed(start)).Warnf("session retrying: %d/%d", i, app.sessionRetryCount)
 					continue
 				}
 				logger.WithField("time_elapsed", tools.TimeElapsed(start)).Warn("service is not ready")
@@ -165,6 +183,10 @@ func (app *App) HandleSession(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			logger.WithField("time_elapsed", tools.TimeElapsed(start)).Errorf("session failed: %v", err)
+			if i < app.sessionRetryCount {
+				logger.WithField("time_elapsed", tools.TimeElapsed(start)).Warnf("session retrying for session failed: %d/%d", i, app.sessionRetryCount)
+				continue
+			}
 			tools.JSONError(w, "New session attempts retry count exceeded", http.StatusInternalServerError)
 			cancel()
 			return
@@ -194,8 +216,9 @@ func (app *App) HandleSession(w http.ResponseWriter, r *http.Request) {
 
 }
 
-//HandleProxy ...
+// HandleProxy ...
 func (app *App) HandleProxy(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	sessionID, ok := mux.Vars(r)["sessionId"]
 	if !ok {
 		app.logger.WithField("request", fmt.Sprintf("%s %s", r.Method, r.URL.Path)).Error("session id not found")
@@ -215,23 +238,112 @@ func (app *App) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		"request":    fmt.Sprintf("%s %s", r.Method, r.URL.Path),
 	})
 
-	(&httputil.ReverseProxy{
-		Director: func(r *http.Request) {
-			r.URL.Scheme = "http"
-			r.Host = sessionID + "." + app.serviceName + ":" + app.sidecarPort
-			r.URL.Host = r.Host
-			r.Header.Set("X-Forwarded-Selenosis", app.selenosisHost)
-			logger.Info("proxying session")
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			logger.Errorf("proxying session error: %v", err)
-			w.WriteHeader(http.StatusBadGateway)
-		},
-	}).ServeHTTP(w, r)
+	// Read request body once
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		logger.WithError(err).Error("Failed to read request body")
+		tools.JSONError(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	r.Body.Close()
 
+	// Prepare target URL
+	r.URL.Scheme = "http"
+	r.Host = sessionID + "." + app.serviceName + ":" + app.sidecarPort
+	r.URL.Host = r.Host
+	r.Header.Set("X-Forwarded-Selenosis", app.selenosisHost)
+
+	// Retry logic with exponential backoff
+	maxRetries := app.requestRetryCount
+	if maxRetries <= 0 {
+		maxRetries = 1 // At least one attempt
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Clone request for each attempt
+		rCopy := r.Clone(r.Context())
+		rCopy.Body = ioutil.NopCloser(bytes.NewReader(body))
+
+		// Track if proxy succeeded
+		proxySucceeded := true
+
+		proxy := &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				// Log only on first attempt or errors
+				if attempt == 1 || lastErr != nil {
+					logger.WithFields(logrus.Fields{
+						"attempt": attempt,
+						"elapsed": time.Since(start),
+					}).Debug("Proxying request to browser")
+				}
+			},
+			ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+				proxySucceeded = false
+				lastErr = err
+
+				logger.WithFields(logrus.Fields{
+					"attempt":     attempt,
+					"max_retries": maxRetries,
+					"elapsed":     time.Since(start),
+					"error":       err.Error(),
+				}).Warn("Proxy request failed")
+
+				// Only send error response on final attempt
+				if attempt >= maxRetries {
+					if strings.Contains(err.Error(), "no such host") {
+						tools.JSONError(w, "Browser session not found: "+err.Error(), http.StatusNotFound)
+					} else if strings.Contains(err.Error(), "connection refused") {
+						tools.JSONError(w, "Browser not responding: "+err.Error(), http.StatusServiceUnavailable)
+					} else if strings.Contains(err.Error(), "context deadline exceeded") || strings.Contains(err.Error(), "timeout") {
+						tools.JSONError(w, "Browser request timeout: "+err.Error(), http.StatusGatewayTimeout)
+					} else {
+						tools.JSONError(w, "Proxy error: "+err.Error(), http.StatusBadGateway)
+					}
+				}
+			},
+		}
+
+		proxy.ServeHTTP(w, rCopy)
+
+		// If proxy succeeded, we're done
+		if proxySucceeded {
+			if attempt > 1 {
+				logger.WithFields(logrus.Fields{
+					"attempt": attempt,
+					"elapsed": time.Since(start),
+				}).Info("Proxy request succeeded after retry")
+			}
+			return
+		}
+
+		// If not final attempt, wait before retry
+		if attempt < maxRetries {
+			// Exponential backoff: 100ms, 200ms, 400ms, 800ms, ...
+			backoff := time.Duration(100*(1<<(attempt-1))) * time.Millisecond
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second // Cap at 2 seconds
+			}
+
+			logger.WithFields(logrus.Fields{
+				"attempt":      attempt,
+				"next_attempt": attempt + 1,
+				"backoff":      backoff,
+			}).Debug("Retrying proxy request after backoff")
+
+			time.Sleep(backoff)
+		}
+	}
+
+	// All retries exhausted
+	logger.WithFields(logrus.Fields{
+		"attempts":   maxRetries,
+		"elapsed":    time.Since(start),
+		"last_error": lastErr,
+	}).Error("Proxy request failed after all retries")
 }
 
-//HandleHubStatus ...
+// HandleHubStatus ...
 func (app *App) HandleHubStatus(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -244,7 +356,7 @@ func (app *App) HandleHubStatus(w http.ResponseWriter, _ *http.Request) {
 		})
 }
 
-//HandleReverseProxy ...
+// HandleReverseProxy ...
 func (app *App) HandleReverseProxy(w http.ResponseWriter, r *http.Request) {
 	sessionID, ok := mux.Vars(r)["sessionId"]
 	if !ok {
@@ -281,7 +393,7 @@ func (app *App) HandleReverseProxy(w http.ResponseWriter, r *http.Request) {
 	}).ServeHTTP(w, r)
 }
 
-//HandleVNC ...
+// HandleVNC ...
 func (app *App) HandleVNC() websocket.Handler {
 	return func(wsconn *websocket.Conn) {
 		defer wsconn.Close()
@@ -322,7 +434,7 @@ func (app *App) HandleVNC() websocket.Handler {
 	}
 }
 
-//HandleLogs ...
+// HandleLogs ...
 func (app *App) HandleLogs() websocket.Handler {
 	return func(wsconn *websocket.Conn) {
 		defer wsconn.Close()
@@ -363,7 +475,7 @@ func (app *App) HandleLogs() websocket.Handler {
 	}
 }
 
-//HandleStatus ...
+// HandleStatus ...
 func (app *App) HandleStatus(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 

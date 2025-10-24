@@ -21,9 +21,13 @@ import (
 	"golang.org/x/net/websocket"
 )
 
-var buildVersion = "HEAD"
+var (
+	buildVersion = "v1.0.0-pod-ip-fix"
+	buildDate    = "unknown"
+	gitCommit    = "unknown"
+)
 
-//Command ...
+// Command ...
 func command() *cobra.Command {
 
 	var (
@@ -35,11 +39,13 @@ func command() *cobra.Command {
 		imagePullSecretName string
 		proxyImage          string
 		sessionRetryCount   int
+		requestRetryCount   int
 		limit               int
 		browserWaitTimeout  time.Duration
 		sessionWaitTimeout  time.Duration
 		sessionIdleTimeout  time.Duration
 		shutdownTimeout     time.Duration
+		logLevel            string
 	)
 
 	cmd := &cobra.Command{
@@ -48,7 +54,24 @@ func command() *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 
 			logger := logrus.New()
-			logger.Infof("starting selenosis %s", buildVersion)
+
+			// Set log level
+			level, err := logrus.ParseLevel(logLevel)
+			if err != nil {
+				logger.Warnf("Invalid log level '%s', using info", logLevel)
+				level = logrus.InfoLevel
+			}
+			logger.SetLevel(level)
+			logger.Infof("Log level set to: %s", level.String())
+
+			logger.WithFields(logrus.Fields{
+				"version":     buildVersion,
+				"build_date":  buildDate,
+				"git_commit":  gitCommit,
+				"go_version":  "1.23.0",
+				"k8s_version": "v0.32.1",
+			}).Info("Starting Selenosis")
+			logger.Infof("Version: %s | Build: %s | Commit: %s", buildVersion, buildDate, gitCommit)
 
 			browsers, err := config.NewBrowsersConfig(cfgFile)
 			if err != nil {
@@ -85,6 +108,7 @@ func command() *cobra.Command {
 				SidecarPort:        proxyPort,
 				SessionLimit:       limit,
 				SessionRetryCount:  sessionRetryCount,
+				RequestRetryCount:  requestRetryCount,
 				BrowserWaitTimeout: browserWaitTimeout,
 				SessionIdleTimeout: sessionIdleTimeout,
 				BuildVersion:       buildVersion,
@@ -142,7 +166,9 @@ func command() *cobra.Command {
 	cmd.Flags().DurationVar(&browserWaitTimeout, "browser-wait-timeout", 30*time.Second, "time in seconds that a browser will be ready")
 	cmd.Flags().DurationVar(&sessionWaitTimeout, "session-wait-timeout", 60*time.Second, "time in seconds that a session will be ready")
 	cmd.Flags().DurationVar(&sessionIdleTimeout, "session-idle-timeout", 5*time.Minute, "time in seconds that a session will idle")
-	cmd.Flags().IntVar(&sessionRetryCount, "session-retry-count", 3, "session retry count")
+	cmd.Flags().IntVar(&sessionRetryCount, "session-retry-count", 3, "session creation retry count")
+	cmd.Flags().IntVar(&requestRetryCount, "request-retry-count", 3, "proxy request retry count with exponential backoff")
+	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (trace, debug, info, warn, error, fatal, panic)")
 	cmd.Flags().DurationVar(&shutdownTimeout, "graceful-shutdown-timeout", 30*time.Second, "time in seconds  gracefull shutdown timeout")
 	cmd.Flags().StringVar(&imagePullSecretName, "image-pull-secret-name", "", "secret name to private registry")
 	cmd.Flags().StringVar(&proxyImage, "proxy-image", "alcounit/seleniferous:latest", "in case you use private registry replace with image from private registry")

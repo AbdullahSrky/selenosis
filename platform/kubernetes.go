@@ -6,24 +6,27 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alcounit/selenosis/tools"
+	"github.com/sirupsen/logrus"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 var (
@@ -55,7 +58,7 @@ var (
 	}
 )
 
-//ClientConfig ...
+// ClientConfig ...
 type ClientConfig struct {
 	Namespace           string
 	Service             string
@@ -66,7 +69,7 @@ type ClientConfig struct {
 	IdleTimeout         time.Duration
 }
 
-//Client ...
+// Client ...
 type Client struct {
 	ns        string
 	svc       string
@@ -76,7 +79,7 @@ type Client struct {
 	quota     QuotaInterface
 }
 
-//NewClient ...
+// NewClient ...
 func NewClient(c ClientConfig) (Platform, error) {
 
 	conf, err := rest.InClusterConfig()
@@ -124,7 +127,7 @@ func (cl *Client) Quota() QuotaInterface {
 	return cl.quota
 }
 
-//List ...
+// List ...
 func (cl *Client) State() (PlatformState, error) {
 	context := context.Background()
 	pods, err := cl.clientset.CoreV1().Pods(cl.ns).List(context, metav1.ListOptions{})
@@ -185,7 +188,7 @@ func (cl *Client) State() (PlatformState, error) {
 
 }
 
-//Watch ...
+// Watch ...
 func (cl *Client) Watch() <-chan Event {
 	ch := make(chan Event)
 	namespace := informers.WithNamespace(cl.ns)
@@ -302,7 +305,7 @@ type service struct {
 	clientset           kubernetes.Interface
 }
 
-//Create ...
+// Create ...
 func (cl *service) Create(layout ServiceSpec) (Service, error) {
 	annontations := map[string]string{
 		defaultsAnnotations.browserName:    layout.Template.BrowserName,
@@ -431,81 +434,179 @@ func (cl *service) Create(layout ServiceSpec) (Service, error) {
 		},
 	}
 
+	logger := logrus.WithFields(logrus.Fields{
+		"function":   "Create",
+		"session_id": layout.SessionID,
+		"image":      layout.Template.Image,
+		"namespace":  cl.ns,
+	})
+
+	logger.Info("Creating browser pod")
+	startTime := time.Now()
+
 	context := context.Background()
 	pod, err := cl.clientset.CoreV1().Pods(cl.ns).Create(context, pod, metav1.CreateOptions{})
 
 	if err != nil {
+		logger.WithError(err).Error("Failed to create pod")
 		return Service{}, fmt.Errorf("failed to create pod %v", err)
 	}
 
 	podName := pod.GetName()
+	logger = logger.WithField("pod_name", podName)
+	logger.WithField("creation_time", time.Since(startTime)).Info("Pod created successfully")
+
 	cancel := func() {
 		cl.Delete(podName)
 	}
 
+	watchTimeout := ptr.To(int64(cl.readinessTimeout.Seconds()))
+	logger.WithField("watch_timeout", cl.readinessTimeout).Info("Starting pod status watch")
+
 	w, err := cl.clientset.CoreV1().Pods(cl.ns).Watch(context, metav1.ListOptions{
 		FieldSelector:  fields.OneTermEqualSelector("metadata.name", podName).String(),
-		TimeoutSeconds: pointer.Int64Ptr(cl.readinessTimeout.Milliseconds()),
+		TimeoutSeconds: watchTimeout,
 	})
 
 	if err != nil {
+		logger.WithError(err).Error("Failed to watch pod status")
 		return Service{}, fmt.Errorf("failed to watch pod status: %v", err)
 	}
 
 	statusFn := func() error {
 		defer w.Stop()
 		var watchedPod *apiv1.Pod
+		watchStart := time.Now()
 
 		for event := range w.ResultChan() {
+			elapsed := time.Since(watchStart)
+
 			switch event.Type {
 			case watch.Error:
+				logger.WithFields(logrus.Fields{
+					"elapsed": elapsed,
+					"event":   event.Object.GetObjectKind().GroupVersionKind().String(),
+				}).Error("Received error event while watching pod")
 				return fmt.Errorf("received error while watching pod: %s",
 					event.Object.GetObjectKind().GroupVersionKind().String())
 			case watch.Deleted, watch.Added, watch.Modified:
 				watchedPod = event.Object.(*apiv1.Pod)
+				logger.WithFields(logrus.Fields{
+					"elapsed":    elapsed,
+					"event_type": event.Type,
+					"phase":      watchedPod.Status.Phase,
+				}).Debug("Pod status event")
 			default:
+				logger.WithFields(logrus.Fields{
+					"elapsed":    elapsed,
+					"event_type": event.Type,
+				}).Warn("Unknown event type")
 				return fmt.Errorf("received unknown event type %s while watching pod", event.Type)
 			}
+
 			if event.Type == watch.Deleted {
+				logger.WithField("elapsed", elapsed).Error("Pod was deleted before becoming available")
 				return errors.New("pod was deleted before becoming available")
 			}
+
 			switch watchedPod.Status.Phase {
 			case apiv1.PodPending:
+				logger.WithFields(logrus.Fields{
+					"elapsed":          elapsed,
+					"container_status": getPodContainerStatus(watchedPod),
+				}).Debug("Pod is pending")
 				continue
 			case apiv1.PodSucceeded, apiv1.PodFailed:
-				return fmt.Errorf("pod exited early with status %s", watchedPod.Status.Phase)
+				reason := getPodFailureReason(watchedPod)
+				logger.WithFields(logrus.Fields{
+					"elapsed": elapsed,
+					"phase":   watchedPod.Status.Phase,
+					"reason":  reason,
+				}).Error("Pod exited early")
+				return fmt.Errorf("pod exited early with status %s: %s", watchedPod.Status.Phase, reason)
 			case apiv1.PodRunning:
+				logger.WithFields(logrus.Fields{
+					"elapsed":    elapsed,
+					"total_time": time.Since(startTime),
+				}).Info("Pod is running")
 				return nil
 			case apiv1.PodUnknown:
+				logger.WithField("elapsed", elapsed).Error("Pod state is unknown")
 				return errors.New("couldn't obtain pod state")
 			default:
+				logger.WithFields(logrus.Fields{
+					"elapsed": elapsed,
+					"phase":   watchedPod.Status.Phase,
+				}).Error("Pod has unknown status")
 				return errors.New("pod has unknown status")
 			}
 		}
-		return fmt.Errorf("pod wasn't running")
+		logger.WithField("elapsed", time.Since(watchStart)).Error("Pod watch channel closed without pod running")
+		return fmt.Errorf("pod wasn't running after %v", time.Since(watchStart))
 	}
 
 	err = statusFn()
 	if err != nil {
+		logger.WithError(err).Error("Pod status check failed")
 		cancel()
 		return Service{}, fmt.Errorf("pod is not ready after creation: %v", err)
 	}
 
+	// Wait a bit for Chrome to initialize after pod becomes Running
+	// This prevents "connection refused" errors when connecting too early
+	initialWait := 3 * time.Second
+	logger.WithField("initial_wait", initialWait).Info("Waiting for Chrome to initialize after pod start")
+	time.Sleep(initialWait)
+
+	// Get pod again to fetch its IP address (avoids DNS lookup issues)
+	pod, err = cl.clientset.CoreV1().Pods(cl.ns).Get(context, podName, metav1.GetOptions{})
+	if err != nil {
+		logger.WithError(err).Error("Failed to get pod IP")
+		cancel()
+		return Service{}, fmt.Errorf("failed to get pod IP: %v", err)
+	}
+
+	podIP := pod.Status.PodIP
+	if podIP == "" {
+		logger.Error("Pod IP is empty")
+		cancel()
+		return Service{}, fmt.Errorf("pod IP is empty")
+	}
+
+	logger.WithField("pod_ip", podIP).Info("Using pod IP for direct connection (bypassing DNS)")
+
+	// Use Pod IP directly instead of DNS name to avoid "no such host" errors
 	u := &url.URL{
 		Scheme: "http",
-		Host:   podName + "." + cl.svc + ":" + browserPorts.selenium.StrVal,
+		Host:   podIP + ":" + browserPorts.selenium.StrVal,
 	}
+
+	logger.WithFields(logrus.Fields{
+		"service_url":       u.String(),
+		"readiness_timeout": cl.readinessTimeout,
+		"using_pod_ip":      true,
+	}).Info("Starting service readiness check")
 
 	if err := waitForService(*u, cl.readinessTimeout); err != nil {
+		logger.WithError(err).Error("Service readiness check failed")
 		cancel()
-		return Service{}, fmt.Errorf("container service is not ready %v", u.String())
+		return Service{}, fmt.Errorf("container service is not ready %v: %v", u.String(), err)
 	}
 
-	u.Host = podName + "." + cl.svc + ":" + cl.svcPort.StrVal
+	// CRITICAL FIX: Keep using Pod IP instead of changing back to DNS name
+	// This eliminates DNS lookup delays and "no such host" errors
+	// u.Host = podName + "." + cl.svc + ":" + cl.svcPort.StrVal  // OLD: Changed to DNS
+	// u already has Pod IP from line 581, keep it!
+
+	logger.WithFields(logrus.Fields{
+		"session_id":  podName,
+		"service_url": u.String(),
+		"pod_ip":      podIP,
+	}).Info("Returning service with Pod IP (bypassing DNS)")
 
 	return Service{
 		SessionID: podName,
-		URL:       u,
+		URL:       u, // Keep Pod IP!
 		Labels:    getRequestedCapabilities(pod.GetAnnotations()),
 		CancelFunc: func() {
 			cancel()
@@ -515,12 +616,12 @@ func (cl *service) Create(layout ServiceSpec) (Service, error) {
 	}, nil
 }
 
-//Delete ...
+// Delete ...
 func (cl *service) Delete(name string) error {
 	return deletePod(cl.clientset, cl.ns, name)
 }
 
-//Logs ...
+// Logs ...
 func (cl *service) Logs(ctx context.Context, name string) (io.ReadCloser, error) {
 	req := cl.clientset.CoreV1().Pods(cl.ns).GetLogs(name, &apiv1.PodLogOptions{
 		Container:  "browser",
@@ -536,7 +637,7 @@ type quota struct {
 	clientset kubernetes.Interface
 }
 
-//Create ...
+// Create ...
 func (cl quota) Create(limit int64) (Quota, error) {
 	context := context.Background()
 	quantity, err := resource.ParseQuantity(strconv.FormatInt(limit, 10))
@@ -575,38 +676,73 @@ func (cl quota) Get() (Quota, error) {
 	}, nil
 }
 
-//Update ...
+// Update ...
 func (cl quota) Update(limit int64) (Quota, error) {
 	context := context.Background()
 	quantity, err := resource.ParseQuantity(strconv.FormatInt(limit, 10))
 	if err != nil {
 		return Quota{}, fmt.Errorf("failed to parse limit amount")
 	}
-	rq := &apiv1.ResourceQuota{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   quotaName,
-			Labels: map[string]string{label: "quota"},
-		},
-		Spec: apiv1.ResourceQuotaSpec{
-			Hard: map[apiv1.ResourceName]resource.Quantity{apiv1.ResourcePods: quantity},
-		},
-	}
-	quota, err := cl.clientset.CoreV1().ResourceQuotas(cl.ns).Update(context, rq, metav1.UpdateOptions{})
-	if err != nil {
+
+	// CRITICAL FIX: Retry loop with exponential backoff for ResourceQuota conflicts
+	// When multiple Selenosis replicas (30) update quota simultaneously, optimistic locking
+	// causes conflicts. We retry with increasing delays to resolve this.
+	// With 30 replicas, we need more retries to ensure all updates succeed.
+	maxRetries := 10
+	var quota *apiv1.ResourceQuota
+	
+	for i := 0; i < maxRetries; i++ {
+		// Get current ResourceQuota to preserve ResourceVersion
+		currentQuota, err := cl.clientset.CoreV1().ResourceQuotas(cl.ns).Get(context, quotaName, metav1.GetOptions{})
+		if err != nil {
+			return Quota{}, fmt.Errorf("failed to get current quota: %v", err)
+		}
+
+		// Update the spec with new limit, but keep existing ResourceVersion
+		currentQuota.Spec.Hard[apiv1.ResourcePods] = quantity
+
+		quota, err = cl.clientset.CoreV1().ResourceQuotas(cl.ns).Update(context, currentQuota, metav1.UpdateOptions{})
+		if err == nil {
+			// Success!
+			return Quota{
+				Name:            quota.GetName(),
+				CurrentMaxLimit: quota.Spec.Hard.Pods().Value(),
+			}, nil
+		}
+
+		// Check if it's a conflict error
+		if strings.Contains(err.Error(), "object has been modified") {
+			// Exponential backoff with jitter to reduce thundering herd
+			// 100ms, 200ms, 400ms, 800ms, 1.6s, 3.2s, 6.4s, 12.8s, 25.6s, 51.2s
+			baseBackoff := time.Duration(100*(1<<uint(i))) * time.Millisecond
+			// Add jitter: ±25% randomness
+			jitterPercent := float64(time.Now().UnixNano()%100) / 100.0 // 0.0 to 1.0
+			jitter := time.Duration(float64(baseBackoff) * 0.25 * (2*jitterPercent - 1))
+			backoff := baseBackoff + jitter
+			
+			// Cap at 5 seconds to avoid too long waits
+			if backoff > 5*time.Second {
+				backoff = 5 * time.Second
+			}
+			
+			time.Sleep(backoff)
+			continue
+		}
+
+		// If it's not a conflict error, fail immediately
 		return Quota{}, fmt.Errorf("resourse quota update error: %v", err)
 	}
 
-	return Quota{
-		Name:            quota.GetName(),
-		CurrentMaxLimit: rq.Spec.Hard.Pods().Value(),
-	}, err
+	// All retries exhausted - this is logged as warning, not critical error
+	// Pod creation still succeeds, just quota tracking may be slightly off
+	return Quota{}, fmt.Errorf("resourse quota update error: max retries (%d) exceeded", maxRetries)
 }
 
 func deletePod(clientset kubernetes.Interface, namespace, name string) error {
 	context := context.Background()
 
 	return clientset.CoreV1().Pods(namespace).Delete(context, name, metav1.DeleteOptions{
-		GracePeriodSeconds: pointer.Int64Ptr(15),
+		GracePeriodSeconds: ptr.To(int64(15)),
 	})
 }
 
@@ -701,36 +837,204 @@ func getSecurityContext(runAsOptions RunAsOptions) *apiv1.PodSecurityContext {
 	return secContext
 }
 
+// Helper function to get pod container status
+func getPodContainerStatus(pod *apiv1.Pod) string {
+	if pod == nil {
+		return "unknown"
+	}
+
+	statuses := []string{}
+	for _, cs := range pod.Status.ContainerStatuses {
+		state := "unknown"
+		if cs.State.Waiting != nil {
+			state = fmt.Sprintf("%s (waiting: %s)", cs.Name, cs.State.Waiting.Reason)
+		} else if cs.State.Running != nil {
+			state = fmt.Sprintf("%s (running)", cs.Name)
+		} else if cs.State.Terminated != nil {
+			state = fmt.Sprintf("%s (terminated: %s)", cs.Name, cs.State.Terminated.Reason)
+		}
+		statuses = append(statuses, state)
+	}
+
+	if len(statuses) == 0 {
+		return "no containers"
+	}
+	return fmt.Sprintf("[%s]", statuses)
+}
+
+// Helper function to get pod failure reason
+func getPodFailureReason(pod *apiv1.Pod) string {
+	if pod == nil {
+		return "unknown"
+	}
+
+	reasons := []string{}
+
+	// Check container statuses
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Terminated != nil {
+			reasons = append(reasons, fmt.Sprintf("container %s: %s (exit code: %d, message: %s)",
+				cs.Name,
+				cs.State.Terminated.Reason,
+				cs.State.Terminated.ExitCode,
+				cs.State.Terminated.Message))
+		}
+		if cs.State.Waiting != nil {
+			reasons = append(reasons, fmt.Sprintf("container %s: %s (message: %s)",
+				cs.Name,
+				cs.State.Waiting.Reason,
+				cs.State.Waiting.Message))
+		}
+	}
+
+	// Check pod conditions
+	for _, cond := range pod.Status.Conditions {
+		if cond.Status == apiv1.ConditionFalse {
+			reasons = append(reasons, fmt.Sprintf("condition %s: %s (message: %s)",
+				cond.Type,
+				cond.Reason,
+				cond.Message))
+		}
+	}
+
+	if len(reasons) == 0 {
+		return pod.Status.Message
+	}
+	return fmt.Sprintf("[%s]", reasons)
+}
+
 func waitForService(u url.URL, t time.Duration) error {
+	logger := logrus.WithFields(logrus.Fields{
+		"function": "waitForService",
+		"url":      u.String(),
+		"timeout":  t,
+	})
+
+	logger.Info("Starting service readiness check")
+
+	// Create custom HTTP client with proper timeouts
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second, // Total request timeout
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   2 * time.Second, // Connection timeout
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   2 * time.Second,
+			ResponseHeaderTimeout: 3 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       30 * time.Second,
+		},
+	}
+
 	up := make(chan struct{})
 	done := make(chan struct{})
+	retryCount := 0
+	maxRetries := int(t.Seconds() / 2) // Retry every 2 seconds
+
+	logger.WithField("max_retries", maxRetries).Info("Calculated max retries")
+
 	go func() {
+		startTime := time.Now()
 		for {
 			select {
 			case <-done:
+				logger.WithField("retry_count", retryCount).Warn("Service check cancelled")
 				return
 			default:
 			}
 
-			req, _ := http.NewRequest(http.MethodHead, u.String(), nil)
-			req.Close = true
-			resp, err := http.DefaultClient.Do(req)
-			if resp != nil {
-				resp.Body.Close()
-			}
+			retryCount++
+			elapsed := time.Since(startTime)
+
+			// Check /status endpoint (Selenium standard)
+			statusURL := u.String() + "/status"
+			req, err := http.NewRequest(http.MethodGet, statusURL, nil)
 			if err != nil {
-				<-time.After(50 * time.Millisecond)
+				logger.WithFields(logrus.Fields{
+					"retry":   retryCount,
+					"elapsed": elapsed,
+					"error":   err,
+				}).Error("Failed to create HTTP request")
+				<-time.After(2 * time.Second)
 				continue
 			}
-			up <- struct{}{}
-			return
+			req.Close = true
+			req.Header.Set("User-Agent", "selenosis-readiness-probe")
+
+			logger.WithFields(logrus.Fields{
+				"retry":    retryCount,
+				"elapsed":  elapsed,
+				"endpoint": statusURL,
+			}).Debug("Attempting HTTP request")
+
+			resp, err := httpClient.Do(req)
+			if resp != nil {
+				defer resp.Body.Close()
+			}
+
+			if err != nil {
+				// Check if it's a DNS lookup error - wait longer for DNS propagation
+				isDNSError := strings.Contains(err.Error(), "no such host") ||
+					strings.Contains(err.Error(), "lookup") ||
+					strings.Contains(err.Error(), "Temporary failure in name resolution")
+
+				waitTime := 2 * time.Second
+				if isDNSError && retryCount < 10 {
+					// First 10 retries for DNS errors: wait 3 seconds (DNS propagation time)
+					waitTime = 3 * time.Second
+				}
+
+				logger.WithFields(logrus.Fields{
+					"retry":      retryCount,
+					"elapsed":    elapsed,
+					"error":      err.Error(),
+					"is_dns_err": isDNSError,
+					"wait_time":  waitTime,
+				}).Warn("HTTP request failed, retrying...")
+				<-time.After(waitTime)
+				continue
+			}
+
+			logger.WithFields(logrus.Fields{
+				"retry":       retryCount,
+				"elapsed":     elapsed,
+				"status_code": resp.StatusCode,
+			}).Info("Received HTTP response")
+
+			// Accept 200 OK or 204 No Content
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+				logger.WithFields(logrus.Fields{
+					"retry":      retryCount,
+					"elapsed":    elapsed,
+					"total_time": time.Since(startTime),
+				}).Info("Service is ready!")
+				up <- struct{}{}
+				return
+			}
+
+			// Log unexpected status codes
+			logger.WithFields(logrus.Fields{
+				"retry":       retryCount,
+				"elapsed":     elapsed,
+				"status_code": resp.StatusCode,
+			}).Warn("Unexpected status code, retrying...")
+
+			<-time.After(2 * time.Second)
 		}
 	}()
+
 	select {
 	case <-time.After(t):
 		close(done)
-		return fmt.Errorf("no responce after %v", t)
+		logger.WithFields(logrus.Fields{
+			"retry_count": retryCount,
+			"timeout":     t,
+		}).Error("Service readiness check timed out")
+		return fmt.Errorf("service not ready after %v (tried %d times)", t, retryCount)
 	case <-up:
+		logger.Info("Service readiness check completed successfully")
 	}
 	return nil
 }
